@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "company_cidrs": ["192.0.2.10/32", "192.0.2.11/32"],
+  "ssh": {
+    "user": "ubuntu",
+    "key_file": "~/.ssh/example-vm-key.pem",
+    "port": 22
+  },
+  "settings": {
+    "ttl_seconds": 3600,
+    "connect_timeout_seconds": 3,
+    "attempts": 2,
+    "public_ip_url": "https://api.ipify.org"
+  },
+  "machines": [
+    {
+      "name": "example-proxy-01",
+      "host": "198.51.100.20",
+      "world_ports": [443, 8443],
+      "company_ports": [8691],
+      "blocked_ports": [18080]
+    },
+    {
+      "name": "example-db-01",
+      "host": "203.0.113.30",
+      "world_ports": [],
+      "company_ports": [3306],
+      "blocked_ports": [18081]
+    }
+  ]
+}

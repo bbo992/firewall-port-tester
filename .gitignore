@@ -1,0 +1,14 @@
+# Real environment settings, SSH material and generated reports stay local.
+*.local.json
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.env
+.env.*
+reports/
+report.json
+report.csv
+__pycache__/
+*.pyc
+.DS_Store
