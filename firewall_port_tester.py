@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit-target TCP access verification from company and external networks."""
+"""Automatically verify new and existing VM TCP ports from company and external networks."""
 import argparse
 import concurrent.futures
 import csv
@@ -109,8 +109,6 @@ def validate(raw, folder):
                 integer(port, 1, 65535, policy)
                 if port in seen:
                     fail(name + ': duplicate port or conflicting policy')
-                if port == target_ssh['port']:
-                    fail(name + ': the SSH management port cannot be a temporary test port')
                 seen.add(port)
             target[policy] = ports
         if not 1 <= len(seen) <= 256:
@@ -153,19 +151,21 @@ def check_source(config, phase):
     return source
 
 
-def remote(machine, run_id, action, settings=None):
+def remote(machine, run_id, action, settings=None, plan=None):
     ssh = machine['ssh']
     source = (ROOT / 'remote_agent.py').read_text()
     request = {'action': action, 'run_id': run_id}
+    if action == 'preflight':
+        request.update(ports=all_ports(machine), management_port=ssh['port'])
     if action == 'start':
-        request.update(ports=all_ports(machine), token='FPT-' + run_id,
+        request.update(ports=all_ports(machine), plan=plan, management_port=ssh['port'], token='FPT-' + run_id,
                        ttl_seconds=settings['ttl_seconds'], source=source)
     command = ['ssh', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=10',
                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
                '-i', ssh['key_file'], '-p', str(ssh['port']),
                ssh['user'] + '@' + machine['host'],
-               shlex.join(['sudo', '-n', 'python3', '-c', source])]
+               shlex.join(['sudo', '-n', 'python3', '-c', source]) + ' "$SSH_CONNECTION"']
     result = subprocess.run(command, input=json.dumps(request), text=True,
                             capture_output=True, timeout=55)
     try:
@@ -187,10 +187,12 @@ def preflight_keys(config):
             fail(machine['name'] + ': SSH key permissions must restrict group/other access (chmod 600)')
 
 
-def probe(host, port, token, timeout):
+def probe(host, port, token, timeout, mode='temporary'):
     deadline = time.monotonic() + timeout
     try:
         with socket.create_connection((host, port), timeout=timeout) as connection:
+            if mode == 'existing':
+                return {'connected': True, 'marker_ok': None, 'detail': 'TCP handshake only; existing service'}
             data = b''
             try:
                 while len(data) < 128 and b'\n' not in data:
@@ -212,7 +214,7 @@ def probe(host, port, token, timeout):
         return {'connected': None, 'marker_ok': False, 'detail': type(exc).__name__}
 
 
-def test_phase(config, phase, run_id, source):
+def test_phase(config, phase, run_id, source, plans=None):
     jobs = []
     settings = config['settings']
     for machine in config['machines']:
@@ -222,21 +224,27 @@ def test_phase(config, phase, run_id, source):
     def task(job):
         machine, policy, port = job
         started_at = time.time()
-        attempts = [probe(machine['host'], port, 'FPT-' + run_id,
-                          settings['connect_timeout_seconds']) for _ in range(settings['attempts'])]
+        item = (plans or {}).get(machine['name'], {}).get(str(port), {'mode': 'temporary'})
+        mode = item['mode']
+        if mode == 'unsupported':
+            attempts = [{'connected': None, 'marker_ok': None, 'detail': item['reason']}]
+        else:
+            attempts = [probe(machine['host'], port, 'FPT-' + run_id,
+                              settings['connect_timeout_seconds'], mode=mode) for _ in range(settings['attempts'])]
         return {'machine': machine['name'], 'host': machine['host'], 'phase': phase,
                 'source_ip': source, 'port': port, 'policy': policy,
+                'mode': mode, 'mode_reason': item.get('reason', ''),
                 'expected': 'ALLOW' if expected(phase, policy) else 'BLOCK',
                 'started_at': started_at, 'finished_at': time.time(),
                 'attempts': attempts, 'result': 'PENDING'}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for row in executor.map(task, jobs):
-            print(f"  {row['machine']}:{row['port']} expected {row['expected']} (pending health verification)", flush=True)
+            print(f"  {row['machine']}:{row['port']} [{row['mode']}] expected {row['expected']} (pending health verification)", flush=True)
             yield row
 
 
 def verdict(row, healthy, cleaned):
-    if not healthy or not cleaned:
+    if row.get('mode') == 'unsupported' or not healthy or not cleaned:
         return 'ERROR'
     attempts = row['attempts']
     if row['expected'] == 'BLOCK':
@@ -245,15 +253,15 @@ def verdict(row, healthy, cleaned):
         return 'PASS' if all(item['connected'] is False for item in attempts) else 'ERROR'
     if any(item['connected'] is None for item in attempts):
         return 'ERROR'
-    if any(item['connected'] and not item['marker_ok'] for item in attempts):
+    if row.get('mode', 'temporary') == 'temporary' and any(item['connected'] and not item['marker_ok'] for item in attempts):
         return 'ERROR'
-    return 'PASS' if all(item['connected'] and item['marker_ok'] for item in attempts) else 'FAIL'
+    return 'PASS' if all(item['connected'] and (row.get('mode') == 'existing' or item['marker_ok']) for item in attempts) else 'FAIL'
 
 
 def save_report(folder, report):
     folder.mkdir(parents=True, exist_ok=True)
     (folder / 'report.json').write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
-    columns = ['machine', 'host', 'phase', 'source_ip', 'port', 'policy', 'expected', 'result']
+    columns = ['machine', 'host', 'phase', 'source_ip', 'port', 'policy', 'mode', 'expected', 'listener_healthy', 'health_reason', 'cleanup_confirmed', 'result']
     with (folder / 'report.csv').open('w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction='ignore')
         writer.writeheader()
@@ -283,10 +291,10 @@ def run(config, folder):
         fail('Output directory already exists; choose a new one')
     folder.mkdir(parents=True, mode=0o700)
     run_id = uuid.uuid4().hex
-    report = {'run_id': run_id, 'status': 'ERROR', 'tests': [], 'hosts': {}, 'errors': []}
+    report = {'report_version': 2, 'run_id': run_id, 'status': 'ERROR', 'tests': [], 'hosts': {}, 'errors': []}
     started = []
     manifest = {'run_id': run_id, 'machines': started}
-    healthy, cleaned = {}, {}
+    healthy, cleaned, plans = {}, {}, {}
     def save_manifest():
         path = folder / 'run.local.json'
         path.write_text(json.dumps(manifest, indent=2))
@@ -294,21 +302,32 @@ def run(config, folder):
     try:
         check_source(config, 'company')
         save_manifest()
+        print('Preflight: checking every VM before starting test services.', flush=True)
+        for machine in config['machines']:
+            response = remote(machine, run_id, 'preflight')
+            plan = response['plan']
+            if set(plan) != {str(p) for p in all_ports(machine)}:
+                fail(machine['name'] + ': incomplete preflight plan')
+            plans[machine['name']] = plan
+            report['hosts'][machine['name']] = {'preflight': plan}
+            for port, item in plan.items():
+                print(f"  {machine['name']}:{port} -> {item['mode']}: {item['reason']}", flush=True)
+        save_report(folder, report)
         for machine in config['machines']:
             # Track before SSH: the remote service may start even if its SSH reply is lost.
             started.append(machine)
             save_manifest()
-            ready = remote(machine, run_id, 'start', config['settings'])
-            report['hosts'][machine['name']] = {'initial': ready}
-            print(machine['name'] + ': temporary listeners ready', flush=True)
+            ready = remote(machine, run_id, 'start', config['settings'], plan=plans[machine['name']])
+            report['hosts'][machine['name']]['initial'] = ready
+            print(machine['name'] + ': temporary listeners and/or existing-service monitor ready', flush=True)
         company_source = check_source(config, 'company')
-        report['tests'].extend(test_phase(config, 'company', run_id, company_source))
+        report['tests'].extend(test_phase(config, 'company', run_id, company_source, plans=plans))
         if check_source(config, 'company') != company_source:
             fail('Public source changed during company probes; rerun this test')
         save_report(folder, report)
         input('\n公司測試完成。請切換至外網（確認 VPN 也已切換），完成後按 Enter：')
         external_source = check_source(config, 'external')
-        report['tests'].extend(test_phase(config, 'external', run_id, external_source))
+        report['tests'].extend(test_phase(config, 'external', run_id, external_source, plans=plans))
         if check_source(config, 'external') != external_source:
             fail('Public source changed during external probes; rerun this test')
         save_report(folder, report)
@@ -320,12 +339,20 @@ def run(config, folder):
                 final = remote(machine, run_id, 'inspect')
                 initial = report['hosts'][name]['initial']['state']
                 state = final['state']
-                healthy[name] = (state['pid'] == initial['pid'] and state['token'] == initial['token']
-                                 and state['ready_at'] == initial['ready_at']
-                                 and state['ports'] == all_ports(machine))
+                continuous = (state['pid'] == initial['pid'] and state['token'] == initial['token']
+                              and state['ready_at'] == initial['ready_at']
+                              and state['ports'] == all_ports(machine))
+                healthy[name] = {}
+                for port in all_ports(machine):
+                    details = state.get('port_status', {}).get(str(port), {})
+                    before = initial.get('port_status', {}).get(str(port), {})
+                    mode = plans[name][str(port)]['mode']
+                    healthy[name][str(port)] = bool(continuous and details.get('healthy')
+                        and before.get('healthy') and details.get('mode') == mode
+                        and before.get('mode') == mode and mode != 'unsupported')
                 report['hosts'][name]['final'] = final
-                if not healthy[name]:
-                    report['errors'].append(name + ': listener continuity not verified')
+                if not all(healthy[name].values()):
+                    report['errors'].append(name + ': some ports have unverified listener continuity')
             except Exception as exc:
                 report['errors'].append(name + ': listener health verification failed')
     except (Exception, KeyboardInterrupt) as exc:
@@ -348,10 +375,15 @@ def run(config, folder):
             except KeyboardInterrupt:
                 report['errors'].append('Cleanup interrupted; remote expiry remains active')
         for row in report['tests']:
-            row['result'] = verdict(row, healthy.get(row['machine'], False), cleaned.get(row['machine'], False))
+            row['listener_healthy'] = healthy.get(row['machine'], {}).get(str(row['port']), False)
+            details = report['hosts'].get(row['machine'], {}).get('final', {}).get('state', {}).get('port_status', {}).get(str(row['port']), {})
+            row['health_reason'] = details.get('reason', 'Listener continuity not verified')
+            row['cleanup_confirmed'] = cleaned.get(row['machine'], False)
+            row['result'] = verdict(row, row['listener_healthy'], row['cleanup_confirmed'])
         for machine in started:
             name = machine['name']
-            report['hosts'].setdefault(name, {}).update(healthy=healthy.get(name, False), cleaned=cleaned.get(name, False))
+            report['hosts'].setdefault(name, {}).update(healthy=bool(healthy.get(name)) and all(healthy[name].values()),
+                port_health=healthy.get(name, {}), cleaned=cleaned.get(name, False))
         if report['errors'] or not report['tests'] or any(r['result'] == 'ERROR' for r in report['tests']):
             report['status'] = 'ERROR'
         elif any(r['result'] == 'FAIL' for r in report['tests']):
@@ -388,6 +420,7 @@ def main(argv=None):
         if args.command == 'validate':
             print('Valid configuration; no SSH, network requests or remote changes performed.')
             print(f"Targets: {len(config['machines'])}; explicit ports: {sum(len(all_ports(m)) for m in config['machines'])}")
+            print('Port occupancy and modes are checked by run over SSH, not by validate.')
             return 0
         output = Path(args.output) if args.output else Path('reports') / (datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         return run(config, output.resolve())

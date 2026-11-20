@@ -24,12 +24,17 @@ class ConfigTests(unittest.TestCase):
         with patch.object(tool, 'public_ip', side_effect=AssertionError), patch.object(tool, 'remote', side_effect=AssertionError):
             self.assertEqual(tool.main(['validate', '--config', str(ROOT / 'examples/targets.example.json')]), 0)
 
-    def test_refuse_conflicting_policy_and_ssh_port(self):
-        for port in (443, 22):
+    def test_refuse_conflicting_policy(self):
+        for port in (443, 8443):
             raw = raw_config()
             raw['machines'][0]['blocked_ports'] = [port]
             with self.assertRaises(ValueError):
                 tool.validate(raw, ROOT)
+
+    def test_management_port_can_be_checked_as_existing_service(self):
+        raw = raw_config()
+        raw['machines'][0]['company_ports'].append(22)
+        self.assertIn(22, tool.validate(raw, ROOT)['machines'][0]['company_ports'])
 
     def test_reject_invalid_inputs(self):
         changes = [lambda r: r.update(company_cidrs=['0.0.0.0/0']),
@@ -135,7 +140,7 @@ class ListenerTests(unittest.TestCase):
             self.assertEqual(json.loads(state.read_text())['status'], 'stopped')
             self.assertFalse(tool.probe('127.0.0.1', port, 'local-test', 1)['connected'])
 
-    def test_occupied_port_is_setup_error_and_existing_listener_survives(self):
+    def test_port_taken_after_preflight_aborts_without_stopping_owner(self):
         with tempfile.TemporaryDirectory() as temp, socket.socket() as existing:
             existing.bind(('127.0.0.1', 0))
             existing.listen()
@@ -156,7 +161,8 @@ class ListenerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / ('a' * 32)
             request = {'action': 'start', 'run_id': 'a' * 32, 'ports': [18080],
-                       'ttl_seconds': 120, 'token': 'FPT-' + 'a' * 32, 'source': '# test stub'}
+                       'ttl_seconds': 120, 'token': 'FPT-' + 'a' * 32, 'source': '# test stub',
+                       'plan': {'18080': {'mode': 'temporary'}}}
             def fake_run(command, **kwargs):
                 self.assertIn('--property=RuntimeMaxSec=120', command)
                 self.assertIn('--property=Restart=no', command)
@@ -211,8 +217,12 @@ class WorkflowTests(unittest.TestCase):
             raw['ssh']['key_file'] = str(key)
             config = tool.validate(raw, ROOT)
             events = []
-            def remote(machine, run_id, action, settings=None):
+            def remote(machine, run_id, action, settings=None, plan=None):
                 events.append((machine['name'], action))
+                if fault == 'preflight' and action == 'preflight':
+                    raise ValueError('preflight failed')
+                if action == 'preflight':
+                    return {'ok': True, 'plan': {str(p): {'mode': 'temporary', 'reason': 'free'} for p in tool.all_ports(machine)}}
                 if fault == 'startup' and action == 'start':
                     raise ValueError('setup failed')
                 if fault == 'health' and action == 'inspect':
@@ -220,8 +230,9 @@ class WorkflowTests(unittest.TestCase):
                 if fault == 'cleanup' and action == 'stop':
                     raise ValueError('cleanup failed')
                 return {'ok': True, 'state': {'pid': 123, 'token': 'FPT-' + run_id,
-                       'ready_at': 10, 'ports': tool.all_ports(machine)}}
-            def phase(config, name, run_id, source):
+                       'ready_at': 10, 'ports': tool.all_ports(machine),
+                       'port_status': {str(p): {'mode': 'temporary', 'healthy': True} for p in tool.all_ports(machine)}}}
+            def phase(config, name, run_id, source, plans=None):
                 for machine in config['machines']:
                     for policy in tool.POLICIES:
                         for port in machine[policy]:
@@ -256,6 +267,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(host['cleaned'] for host in report['hosts'].values()))
         self.assertIn('public IP endpoint unavailable', report['errors'])
 
+    def test_all_preflight_checks_finish_before_any_service_start(self):
+        code, _, events = self.exercise()
+        self.assertEqual(code, 0)
+        first_start = next(i for i, (_, action) in enumerate(events) if action == 'start')
+        self.assertEqual([action for _, action in events[:first_start]], ['preflight', 'preflight'])
+
+    def test_preflight_failure_starts_no_services(self):
+        code, report, events = self.exercise('preflight')
+        self.assertEqual(code, 2)
+        self.assertFalse(any(action in ('start', 'stop') for _, action in events))
+        self.assertEqual(report['tests'], [])
+
     def test_health_failure_invalidates_negative_results(self):
         code, report, _ = self.exercise('health')
         self.assertEqual(code, 2)
@@ -286,10 +309,12 @@ class WorkflowTests(unittest.TestCase):
             raw['ssh']['key_file'] = str(key)
             config = tool.validate(raw, ROOT)
             events = []
-            def remote(machine, run_id, action, settings=None):
+            def remote(machine, run_id, action, settings=None, plan=None):
                 events.append(action)
+                if action == 'preflight':
+                    return {'ok': True, 'plan': {str(p): {'mode': 'temporary', 'reason': 'free'} for p in tool.all_ports(machine)}}
                 return {'ok': True, 'state': {}}
-            def phase(*args):
+            def phase(*args, **kwargs):
                 return iter([])
             sources = ['192.0.2.10', '192.0.2.10', '192.0.2.10',
                        ValueError('still using company egress'), '192.0.2.10']

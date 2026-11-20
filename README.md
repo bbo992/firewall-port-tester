@@ -1,8 +1,26 @@
 # firewall-port-tester
 
-A reusable tool to verify **TCP port access after VM provisioning**. It starts temporary listeners over SSH, tests an explicit list of IP addresses and ports from company and external networks, and produces local JSON/CSV reports.
+[English](README.md) | [繁體中文](README.zh-TW.md)
 
-這是 VM 建立後，用來確認 IP／TCP port 存取規則是否符合預期的工具。只測試你明確指定、自己管理或已獲授權的主機；不是資安弱點掃描、密碼破解或入侵工具，也不會自動探索其他主機或掃描整段 port。
+A reusable tool to verify **TCP port access on new or existing VMs**. It checks every target over SSH, uses temporary listeners for empty ports and existing services for occupied ports, then tests company/external access and produces local JSON/CSV reports. Mode selection is automatic for each port; your configuration stays the same.
+
+Use it only for VMs you own or have permission to test. It checks the hosts and TCP ports you list. It is not a vulnerability scanner, password cracker, or intrusion tool, and it does not discover other hosts or scan port ranges.
+
+## Simple workflow with an AI assistant
+
+**Company network → external network → company network → report**
+
+You can ask an AI assistant to prepare and run the test, or run the commands yourself. Start your VMs and make sure SSH works before you begin.
+
+1. **Provide the test details.** Give the AI the VM public IPv4 addresses, company public IP/CIDR list, SSH username, local private-key path, and the ports that should be public, company-only, or blocked. Provide the key path only, never the private-key contents.
+2. **Prepare the configuration.** The AI reads this project, creates the local `targets.local.json`, and validates it. Actual testing starts after you authorize it. Copyable prompts are in [AI-GUIDE.md](AI-GUIDE.md).
+3. **Let the tool check ports and choose modes.** All VMs are checked before any test service starts. Empty ports receive a temporary Python listener; occupied ports use the existing service. A monitor tracks existing listeners without taking over their ports. Unusable or uncertain bindings are marked `ERROR`, not treated as a working firewall block.
+4. **Test from the company network.** The tool checks that public and company-only ports are reachable, while blocked ports are not.
+5. **Switch to an external network when prompted.** For example, connect your laptop to your phone's hotspot using **4G/5G mobile data**. Check that your VPN is not still sending traffic through the company. Tell the AI when you have switched, or press Enter if you are running the tool yourself. The tool checks the public source IP, then tests that public ports are reachable and company-only/blocked ports are not.
+6. **Switch back to the company network when prompted.** The tool reconnects over SSH and checks temporary-listener continuity and existing-listener identity/readiness evidence for both test phases.
+7. **Clean up and review the report.** The tool stops its temporary listeners and monitor, removes their files, and saves JSON/CSV reports locally. Ask the AI to explain PASS, FAIL, and ERROR results. The report does not mark an unverified listener or cleanup as PASS.
+
+The default **one-hour listener lifetime is a fallback cleanup limit**, not a connection timeout. Normal cleanup runs as soon as testing is done. Each connection attempt has a 3-second budget by default, with two attempts per port.
 
 ## What it checks
 
@@ -12,17 +30,38 @@ A reusable tool to verify **TCP port access after VM provisioning**. It starts t
 | `company_ports` | Allow | Block |
 | `blocked_ports` | Block | Block |
 
-All selected ports, **including blocked ports**, receive temporary listeners. After external testing, return to the company network so the tool can verify that the same listener process stayed healthy throughout the test and then remove it. Failed connections without this evidence receive `ERROR`, not `PASS`.
+All selected ports, **including blocked ports**, need a verified TCP listener. The tool creates one only when the port is empty. After external testing, return to the company network to verify monitoring evidence and clean up this run. Failed connections without listener evidence receive `ERROR`, not `PASS`.
 
 Results describe end-to-end TCP reachability from the laptop. They do not identify whether a cloud NSG, host firewall, upstream router or another layer permitted/blocked traffic. TLS, application behavior, private-network traffic and third-party-specific allowlists are outside this version's scope. Public-IP checks do not prove the exact routing of every target, especially with split-tunnel VPNs; verify your routing independently when applicable.
+
+## Automatic port modes
+
+The tool performs preflight on **all VMs before starting any test listener or monitor**. It checks listening sockets, the SSH destination IPv4 interface, host NAT/redirect rules, and TCP readiness. For empty ports it briefly binds without listening, then releases the port. Preflight failure on any VM aborts before test services start. Preflight may make one short local TCP connection to each existing candidate port.
+
+| Detected state | Automatic mode | Behavior |
+| --- | --- | --- |
+| Empty TCP port that can be bound | `temporary` | Create a test listener and verify its run marker. |
+| Existing listener accepting IPv4 TCP on the target interface | `existing` | Use TCP handshakes only; send/read no application data or test marker. |
+| Localhost-only/wrong-interface binding, unready listener, unverifiable identity, or reserved port | `unsupported` | Skip network probes for that port and report `ERROR`; leave it unchanged. |
+
+One VM can mix these modes. The SSH management port may be listed, but only as an existing listener; the tool will never create a listener on a missing management port. A port taken after preflight makes setup fail and triggers cleanup; it is not silently taken over or reclassified.
+
+For existing services, a per-run monitor samples Linux listening-socket identities and listen-queue capacity about once per second. A missing/replaced listener, binding change, full/unverifiable listen queue, read error, or monitoring gap longer than 3 seconds remains an error even if the listener recovers. On return to company access, the tool also makes one local TCP readiness check per existing port. Only that port is invalidated when its evidence fails; other ports can still pass. This is sampled TCP-listener evidence, not continuous application-health monitoring; brief changes between samples may be missed.
+
+Existing-service probes create real TCP connections that close without application data. They can still produce logs, incomplete-handshake messages, connection counters, or rate-limit events. Use a suitable testing window for live services. The tool never stops, restarts, reconfigures, or sends login/HTTP/database commands to those services.
+
+This version supports direct listeners in the VM's host network namespace. Detected DNAT, REDIRECT, or transparent-proxy forwarding aborts preflight conservatively, even if a forwarding rule appears unrelated to the selected ports. Container-published ports, port-forwarding setups and targets whose public route reaches a different interface/endpoint need separate verification. Missing or unreadable forwarding-rule tools also abort preflight instead of assuming the ports are free. NAT outside the VM, such as a cloud public-IP mapping to the SSH destination interface, does not itself trigger this host-rule check.
+
+Linux socket identity comes from the [documented TCP socket tables](https://docs.kernel.org/networking/proc_net_tcp.html), with queue data from [`ss`](https://man7.org/linux/man-pages/man8/ss.8.html). A report records each port's `mode`, `listener_healthy`, `health_reason`, and `cleanup_confirmed`; JSON report format is version 2. No new configuration fields are required.
 
 ## Requirements
 
 - Local macOS or Linux, Bash, Python 3.9+ and OpenSSH client. No pip packages needed.
-- Remote Linux VM with Python 3.9+, systemd (`systemctl`, `systemd-run`) and an SSH account allowed to run `sudo -n python3`. The complete flow has also been tested from macOS against Ubuntu 26.04/systemd VMs. Other images still require compatibility verification.
+- Remote Linux VM with Python 3.9+, systemd (`systemctl`, `systemd-run`) and an SSH account allowed to run `sudo -n python3`. The earlier temporary-listener flow was tested from macOS against Ubuntu 26.04/systemd VMs; automatic existing-service mode has local/mocked regression coverage and still needs an authorized integration test on your own VM image.
 - SSH authentication must already work non-interactively. For an encrypted key, load the matching key in `ssh-agent` first. Private keys remain on the laptop.
 - SSH reachable from the company network. It need not be reachable from external networks.
-- Selected test ports must be unused. The tool will not stop existing services. Do not list the SSH management port as a temporary test port.
+- Remote access to `/proc/net/tcp` and `/proc/net/tcp6` when IPv6 is enabled, `ss` to inspect listener queues, plus `nft` or `iptables-save` to inspect forwarding rules. No packages are installed by the tool.
+- Existing services must accept IPv4 TCP on the SSH destination interface (or a wildcard binding). Localhost-only, forwarded, or uncertain endpoints are not reported as valid firewall blocks.
 - Enough time for both network switches before the configured listener lifetime expires (default: one hour).
 
 ## Quick start
@@ -44,7 +83,7 @@ By default each attempt has a **3-second total budget for TCP connection plus ma
 `validate` only checks configuration and performs **no SSH connections, HTTP requests or remote changes**. `run` performs the following:
 
 1. Check that the laptop's public IPv4 belongs to `company_cidrs`.
-2. Use SSH and passwordless sudo to start a unique transient systemd listener service on each VM. All listeners must bind successfully before testing begins. An occupied port aborts setup and triggers cleanup; no existing service is stopped.
+2. Preflight every VM and choose a mode for each port. Then use SSH and passwordless sudo to start a unique transient systemd listener/monitor service on each VM. Bind only empty ports; existing applications keep ownership of their ports.
 3. Test company expectations, then prompt you to switch to an external network. Disable/change any VPN that would keep traffic on the company egress IP.
 4. Verify that the source is outside `company_cidrs`, then test external expectations.
 5. Prompt you to return to the company network. Retrieve listener health, verify continuity, stop this run's test services, remove their files, and write the final report.
@@ -59,12 +98,12 @@ Default output: `reports/<local-time>-<random-id>/report.json` and `report.csv`.
 
 - `PASS`: observations match the expectation; listener continuity and cleanup are confirmed.
 - `FAIL`: observations contradict the expectation with healthy listeners and confirmed cleanup.
-- `ERROR`: incomplete run, wrong network, setup/SSH/marker failure, expired/unhealthy listener, or unconfirmed cleanup. This does not prove a firewall rule worked.
+- `ERROR`: incomplete run, wrong network, preflight/setup/SSH/marker failure, unsupported binding, changed/unverified existing listener, expired/unhealthy monitor, or unconfirmed cleanup. This does not prove a firewall rule worked.
 - Exit codes: `0` = PASS; `1` = FAIL; `2` = ERROR.
 
-The service listens on `0.0.0.0` for the explicitly listed TCP ports and returns only a run identifier. It does not serve files or install packages. It does not modify cloud or OS firewall rules. If a supposedly blocked port is misconfigured, this intentionally makes a harmless test listener reachable so the test can detect it.
+Temporary mode listens on `0.0.0.0` for the selected empty TCP ports and returns only a run identifier. Existing mode leaves the service in place and records listener evidence; cleanup stops only the test listener/monitor unit. The tool serves no files and installs no packages. It does not modify cloud or OS firewall rules. If a supposedly blocked port is misconfigured, this intentionally makes a harmless test listener reachable so the test can detect it.
 
-`RuntimeMaxSec` stops the service even if SSH or the laptop disconnects. The listener also has its own lifetime limit. `ExecStopPost` removes its run directory under `/run/firewall-port-tester/<random-id>`; `/run` is cleared on reboot. Normal cleanup happens immediately after testing. Cleanup attempts SSH even if the public-IP endpoint is unavailable; failed cleanup remains ERROR and the independent expiry still applies. No persistent startup service is installed. The empty root-owned base directory may remain.
+`RuntimeMaxSec` stops only the test listener/monitor service even if SSH or the laptop disconnects; existing applications keep running. The listener also has its own lifetime limit. `ExecStopPost` removes its run directory under `/run/firewall-port-tester/<random-id>`; `/run` is cleared on reboot. Normal cleanup happens immediately after testing. Cleanup attempts SSH even if the public-IP endpoint is unavailable; failed cleanup remains ERROR and the independent expiry still applies. No persistent startup service is installed. The empty root-owned base directory may remain.
 
 If interrupted while outside the company network, return to company access and run:
 

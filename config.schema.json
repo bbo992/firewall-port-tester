@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Firewall port tester configuration",
-  "description": "Actual environment settings must remain in ignored *.local.json files. IPv4/TCP only.",
+  "description": "Actual environment settings stay in ignored *.local.json. IPv4/TCP only. Run automatically detects temporary/existing/unsupported mode per port; mode is not an input field.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -145,11 +145,11 @@
             },
             "uniqueItems": true,
             "maxItems": 256,
-            "description": "Expected blocked from both sources; a temporary listener is still required."
+            "description": "Expected blocked from both sources; requires a verified temporary or existing listener. Missing/unverifiable listeners are ERROR."
           }
         }
       }
     }
   },
-  "$comment": "Runtime validation additionally enforces IPv4/CIDR correctness, at least one port per machine, unique names/hosts, disjoint policies and exclusion of the SSH management port."
+  "$comment": "Runtime validation enforces IPv4/CIDR correctness, at least one port per machine, unique names/hosts and disjoint policies. Run preflights all VMs before starting test services and chooses per-port mode automatically. SSH management ports are existing-only. JSON reports use report_version 2."
 }
